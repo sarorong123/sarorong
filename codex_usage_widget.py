@@ -18,14 +18,44 @@ SETTINGS_PATH = os.path.join(
     "CodexUsageWidget",
     "settings.json",
 )
+FULL_WIDGET_SIZE = (420, 250)
+COMPACT_WIDGET_SIZE = (330, 140)
+
+
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 def load_settings():
-    defaults = {"opacity": 0.9, "locked_top_left": True, "x": 0, "y": 0}
+    defaults = {
+        "opacity": 0.9,
+        "dock_bottom": True,
+        "x": 0,
+        "y": 0,
+        "compact_mode": False,
+        "layout_version": 4,
+    }
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as file:
             saved = json.load(file)
         defaults.update({key: saved[key] for key in defaults if key in saved})
+        if "compact_mode" not in saved:
+            old_options = ("show_usage_bars", "show_refresh_interval", "show_last_updated")
+            defaults["compact_mode"] = all(saved.get(key) is False for key in old_options)
+        saved_layout_version = saved.get("layout_version", 1)
+        if saved_layout_version < 4 and defaults["compact_mode"] and not defaults["dock_bottom"]:
+            if "compact_mode" not in saved:
+                old_width, old_height = FULL_WIDGET_SIZE
+            elif saved_layout_version >= 3:
+                old_width, old_height = (220, 64)
+            elif saved_layout_version >= 2:
+                old_width, old_height = (290, 160)
+            else:
+                old_width, old_height = (320, 190)
+            defaults["x"] = int(defaults["x"]) + old_width - COMPACT_WIDGET_SIZE[0]
+            defaults["y"] = int(defaults["y"]) + old_height - COMPACT_WIDGET_SIZE[1]
+        defaults["layout_version"] = 4
     except (OSError, ValueError, TypeError):
         pass
     return defaults
@@ -129,6 +159,17 @@ def display_lines(windows):
     return lines or ["표시할 사용량 데이터가 없습니다."]
 
 
+def usage_records(windows):
+    records = []
+    for minutes, value in sorted(windows.items()):
+        label = "5시간" if minutes == 300 else "주간" if minutes == 10080 else f"{minutes}분"
+        remaining = max(0, min(100, 100 - float(value["usedPercent"])))
+        reset = value.get("resetsAt")
+        reset_text = datetime.fromtimestamp(reset).strftime("%m/%d %H:%M") if reset else ""
+        records.append({"label": label, "remaining": remaining, "reset": reset_text, "resets_at": reset})
+    return records
+
+
 def read_once():
     client = CodexClient()
     try:
@@ -142,79 +183,135 @@ def run_widget():
 
     settings = load_settings()
     root = tk.Tk()
-    root.title("Codex 사용량")
+    root.title("사로롱의 Codex 사용량")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.attributes("-alpha", max(0.1, min(1.0, float(settings["opacity"]))))
     root.resizable(False, False)
-    root.configure(bg="#181b24")
-    x = 0 if settings["locked_top_left"] else int(settings["x"])
-    y = 0 if settings["locked_top_left"] else int(settings["y"])
-    root.geometry(f"310x151{x:+d}{y:+d}")
+    transparent_key = "#ff00ff"
+    root.configure(bg=transparent_key)
+    try:
+        root.wm_attributes("-transparentcolor", transparent_key)
+    except tk.TclError:
+        pass
 
-    heading = tk.Label(root, text="Codex 사용량", bg="#181b24", fg="#ffffff", font=("Malgun Gothic", 12, "bold"))
-    heading.pack(anchor="w", padx=14, pady=(10, 3))
-    body = tk.Label(root, text="불러오는 중…", bg="#181b24", fg="#dce3ef", font=("Malgun Gothic", 10), justify="left", anchor="w")
-    body.pack(fill="x", padx=14)
-    footer = tk.Label(root, text="", bg="#181b24", fg="#8f9aab", font=("Malgun Gothic", 8), anchor="w")
-    footer.pack(fill="x", padx=14, pady=(4, 0))
+    width, height = COMPACT_WIDGET_SIZE if settings["compact_mode"] else FULL_WIDGET_SIZE
+    canvas = tk.Canvas(root, width=width, height=height, bg=transparent_key, highlightthickness=0, bd=0)
+    canvas.pack()
+    mascot_source = tk.PhotoImage(file=resource_path(os.path.join("assets", "codex_mascot.png")))
+    mascot_image = mascot_source.zoom(3, 3).subsample(5, 5)
 
-    opacity_row = tk.Frame(root, bg="#181b24")
-    opacity_row.pack(fill="x", padx=14, pady=(0, 7))
-    opacity_label = tk.Label(opacity_row, text="투명도", bg="#181b24", fg="#b7c2d1", font=("Malgun Gothic", 9))
-    opacity_label.pack(side="left")
-    opacity_value = tk.Label(opacity_row, text="", bg="#181b24", fg="#dce3ef", font=("Malgun Gothic", 9), width=4)
-    opacity_value.pack(side="right")
+    def work_area():
+        if sys.platform == "win32":
+            try:
+                import ctypes
 
-    slider = tk.Canvas(opacity_row, width=166, height=24, bg="#181b24", highlightthickness=0, bd=0)
-    slider.pack(side="right", padx=(4, 7))
-    track_left, track_right, track_y = 9, 157, 12
-    knob_radius = 7
-    track = slider.create_line(track_left, track_y, track_right, track_y, fill="#52627a", width=5)
-    active = slider.create_line(track_left, track_y, track_left, track_y, fill="#8ab4ff", width=5)
-    knob = slider.create_oval(0, 0, 0, 0, fill="#dce3ef", outline="#ffffff", width=1)
-    opacity_dragging = {"active": False}
+                class Rect(ctypes.Structure):
+                    _fields_ = [(name, ctypes.c_long) for name in ("left", "top", "right", "bottom")]
 
-    def set_opacity(percent, save=False):
-        percent = max(10, min(100, int(round(float(percent)))))
-        settings["opacity"] = percent / 100
-        root.attributes("-alpha", settings["opacity"])
-        opacity_value.config(text=f"{percent}%")
-        ratio = (percent - 10) / 90
-        knob_x = track_left + ratio * (track_right - track_left)
-        slider.coords(active, track_left, track_y, knob_x, track_y)
-        slider.coords(knob, knob_x - knob_radius, track_y - knob_radius, knob_x + knob_radius, track_y + knob_radius)
-        if save:
-            save_settings(settings)
+                rect = Rect()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    return rect.left, rect.top, rect.right, rect.bottom
+            except (AttributeError, OSError):
+                pass
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
-    def opacity_start(_event):
-        opacity_dragging["active"] = True
-        return "break"
+    left, top, right, bottom = work_area()
 
-    def opacity_drag(_event):
-        if not opacity_dragging["active"]:
-            return "break"
-        ratio = max(0.0, min(1.0, (_event.x - track_left) / (track_right - track_left)))
-        set_opacity(10 + ratio * 90)
-        return "break"
+    def bottom_right_position():
+        x = max(left, right - width - 18)
+        y = max(top, bottom - height - 12)
+        return x, y
 
-    def opacity_end(_event):
-        if opacity_dragging["active"]:
-            opacity_dragging["active"] = False
-            save_settings(settings)
-        return "break"
+    if settings.get("dock_bottom", True):
+        x, y = bottom_right_position()
+    else:
+        x, y = int(settings["x"]), int(settings["y"])
+    root.geometry(f"{width}x{height}{x:+d}{y:+d}")
 
-    def slider_press(event):
-        if knob in slider.find_withtag("current"):
-            return opacity_start(event)
-        return "break"
+    def rounded_rect(x1, y1, x2, y2, radius, **options):
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1,
+            x2, y1 + radius, x2, y2 - radius, x2, y2,
+            x2 - radius, y2, x1 + radius, y2, x1, y2,
+            x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return canvas.create_polygon(points, smooth=True, splinesteps=12, **options)
 
-    slider.bind("<ButtonPress-1>", slider_press)
-    slider.bind("<B1-Motion>", opacity_drag)
-    slider.bind("<ButtonRelease-1>", opacity_end)
-    slider.tag_bind(knob, "<Enter>", lambda _event: slider.config(cursor="sb_h_double_arrow"))
-    slider.tag_bind(knob, "<Leave>", lambda _event: slider.config(cursor="arrow"))
-    set_opacity(round(float(settings["opacity"]) * 100))
+    view_state = {"records": [], "updated_at": "", "error": "", "loading": True}
+
+    def draw_bubble():
+        canvas.delete("all")
+        compact = settings["compact_mode"]
+        bubble_fill = "#fffdf8"
+        bubble_edge = "#d8c9ec"
+        if compact:
+            rounded_rect(6, 36, 224, 104, 5, fill="#27292e", outline="", tags="art")
+            records = view_state["records"]
+            if records:
+                if len(records) > 1:
+                    canvas.create_line(10, 70, 220, 70, fill="#3c3e43", width=1, tags="art")
+                now = datetime.now().date()
+                for index, record in enumerate(records[:2]):
+                    row_y = 55 + index * 30
+                    label = "1주" if record["label"] == "주간" else record["label"]
+                    canvas.create_text(13, row_y, text=label, anchor="w", fill="#dedfe2", font=("Malgun Gothic", 10, "bold"), tags="art")
+                    canvas.create_text(92, row_y, text=f"{record['remaining']:.0f}%", anchor="w", fill="#bfc1c6", font=("Malgun Gothic", 10), tags="art")
+                    reset_timestamp = record.get("resets_at")
+                    if reset_timestamp:
+                        reset_at = datetime.fromtimestamp(reset_timestamp)
+                        if reset_at.date() == now:
+                            period = "오전" if reset_at.hour < 12 else "오후"
+                            hour = reset_at.hour % 12 or 12
+                            reset = f"{period} {hour}:{reset_at.minute:02d}"
+                        else:
+                            reset = f"{reset_at.month}월 {reset_at.day}일"
+                    else:
+                        reset = "—"
+                    canvas.create_text(136, row_y, text=reset, anchor="w", fill="#aeb0b6", font=("Malgun Gothic", 9), tags="art")
+            else:
+                if view_state["error"]:
+                    status = "사용량 조회 실패"
+                elif view_state["loading"]:
+                    status = "사용량을 불러오는 중…"
+                else:
+                    status = "표시할 사용량 데이터가 없습니다."
+                canvas.create_text(115, 70, text=status, anchor="center", fill="#dedfe2", font=("Malgun Gothic", 9), tags="art")
+        else:
+            canvas.create_polygon(302, 151, 339, 179, 333, 146, fill=bubble_fill, outline=bubble_edge, width=2, smooth=True, tags="art")
+            rounded_rect(14, 13, 383, 163, 18, fill=bubble_fill, outline=bubble_edge, width=2, tags="art")
+            canvas.create_text(31, 36, text="사로롱의 Codex 사용량", anchor="w", fill="#4d3e59", font=("Malgun Gothic", 12, "bold"), tags="art")
+            canvas.create_text(364, 36, text="10초마다 갱신", anchor="e", fill="#6cab9e", font=("Malgun Gothic", 8), tags="art")
+            records = view_state["records"]
+            if records:
+                for index, record in enumerate(records[:2]):
+                    row_y = 69 + index * 35
+                    label = record["label"]
+                    remaining = record["remaining"]
+                    canvas.create_text(31, row_y, text=label, anchor="w", fill="#65596b", font=("Malgun Gothic", 9, "bold"), tags="art")
+                    rounded_rect(91, row_y - 5, 243, row_y + 4, 5, fill="#eee9f1", outline="", tags="art")
+                    bar_color = "#75cbbb" if remaining > 20 else "#f0bc70" if remaining > 10 else "#e98c93"
+                    fill_right = 92 + 150 * remaining / 100
+                    if fill_right - 92 >= 4:
+                        rounded_rect(92, row_y - 4, fill_right, row_y + 3, 4, fill=bar_color, outline="", tags="art")
+                    canvas.create_text(253, row_y, text=f"{remaining:.0f}% 남음", anchor="w", fill="#4d3e59", font=("Malgun Gothic", 9, "bold"), tags="art")
+                    reset = record["reset"] or "초기화 시각 없음"
+                    canvas.create_text(91, row_y + 12, text=f"초기화 {reset}", anchor="w", fill="#9a8e9e", font=("Malgun Gothic", 8), tags="art")
+                if view_state["updated_at"]:
+                    canvas.create_text(31, 145, text=f"{view_state['updated_at']} 갱신", anchor="w", fill="#9a8e9e", font=("Malgun Gothic", 8), tags="art")
+            else:
+                if view_state["error"]:
+                    status = f"조회 실패: {view_state['error']}"
+                elif view_state["loading"]:
+                    status = "사용량을 불러오는 중…"
+                else:
+                    status = "표시할 사용량 데이터가 없습니다."
+                canvas.create_text(31, 82, text=status, anchor="w", fill="#766982", font=("Malgun Gothic", 10), tags="art")
+                if view_state["error"]:
+                    canvas.create_text(31, 111, text="Codex 앱에 로그인되어 있는지 확인해 주세요.", anchor="w", fill="#9a8e9e", font=("Malgun Gothic", 8), tags="art")
+        canvas.create_image(270 if compact else 356, 70 if compact else 185, image=mascot_image, anchor="center", tags="art")
+
+    draw_bubble()
 
     events = queue.Queue()
     refresh = threading.Event()
@@ -231,14 +328,14 @@ def run_widget():
             try:
                 if client is None or client.proc.poll() is not None:
                     client = CodexClient()
-                lines = display_lines(summarize(client.request("account/rateLimits/read")))
+                records = usage_records(summarize(client.request("account/rateLimits/read")))
                 updated = datetime.now().strftime("%H:%M:%S")
-                events.put(("\n".join(lines), f"{updated} 갱신 · 10초 간격 · 우클릭 메뉴"))
+                events.put((records, updated, ""))
             except Exception as exc:
                 if client:
                     client.close()
                     client = None
-                events.put(("조회 실패", str(exc)))
+                events.put(([], "", str(exc)))
         if client:
             client.close()
 
@@ -247,9 +344,9 @@ def run_widget():
     def update_ui():
         try:
             while True:
-                main, status = events.get_nowait()
-                body.config(text=main)
-                footer.config(text=status)
+                records, updated_at, error = events.get_nowait()
+                view_state.update(records=records, updated_at=updated_at, error=error, loading=False)
+                draw_bubble()
         except queue.Empty:
             pass
         if not stop.is_set():
@@ -257,18 +354,53 @@ def run_widget():
 
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="새로고침", command=refresh.set)
+    menu.add_separator()
 
-    locked_choice = tk.BooleanVar(value=bool(settings["locked_top_left"]))
+    compact_choice = tk.BooleanVar(value=settings["compact_mode"])
 
-    def toggle_lock():
-        settings["locked_top_left"] = locked_choice.get()
-        if settings["locked_top_left"]:
-            root.geometry("+0+0")
-            settings["x"] = 0
-            settings["y"] = 0
+    def toggle_compact():
+        nonlocal width, height
+        next_width, next_height = COMPACT_WIDGET_SIZE if compact_choice.get() else FULL_WIDGET_SIZE
+        if settings["dock_bottom"]:
+            width, height = next_width, next_height
+            x, y = bottom_right_position()
+        else:
+            x = root.winfo_x() + width - next_width
+            y = root.winfo_y() + height - next_height
+            width, height = next_width, next_height
+            settings["x"], settings["y"] = x, y
+        settings["compact_mode"] = compact_choice.get()
+        canvas.configure(width=width, height=height)
+        root.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        save_settings(settings)
+        draw_bubble()
+
+    menu.add_checkbutton(label="간소화", variable=compact_choice, command=toggle_compact)
+
+    menu.add_separator()
+    dock_choice = tk.BooleanVar(value=bool(settings.get("dock_bottom", True)))
+
+    def toggle_dock():
+        settings["dock_bottom"] = dock_choice.get()
+        if settings["dock_bottom"]:
+            x, y = bottom_right_position()
+            root.geometry(f"+{x}+{y}")
+        else:
+            settings["x"] = root.winfo_x()
+            settings["y"] = root.winfo_y()
         save_settings(settings)
 
-    menu.add_checkbutton(label="왼쪽 위 고정", variable=locked_choice, command=toggle_lock)
+    menu.add_checkbutton(label="모니터 아래쪽에 붙이기", variable=dock_choice, command=toggle_dock)
+    opacity_menu = tk.Menu(menu, tearoff=0)
+    menu.add_cascade(label="투명도", menu=opacity_menu)
+
+    def set_opacity(percent):
+        settings["opacity"] = percent / 100
+        root.attributes("-alpha", settings["opacity"])
+        save_settings(settings)
+
+    for percent in range(100, 0, -10):
+        opacity_menu.add_command(label=f"{percent}%", command=lambda value=percent: set_opacity(value))
     menu.add_separator()
 
     def quit_app():
@@ -286,32 +418,29 @@ def run_widget():
     move_drag = {}
 
     def start_move(event):
-        if settings["locked_top_left"]:
-            return
         move_drag["x"] = event.x_root - root.winfo_x()
         move_drag["y"] = event.y_root - root.winfo_y()
+        if settings.get("dock_bottom", True):
+            settings["dock_bottom"] = False
+            dock_choice.set(False)
 
     def move_window(event):
-        if not settings["locked_top_left"] and "x" in move_drag:
+        if "x" in move_drag:
             next_x = event.x_root - move_drag["x"]
             next_y = event.y_root - move_drag["y"]
             root.geometry(f"{next_x:+d}{next_y:+d}")
 
     def finish_move(_event):
-        if not settings["locked_top_left"] and "x" in move_drag:
+        if "x" in move_drag:
             settings["x"] = root.winfo_x()
             settings["y"] = root.winfo_y()
             save_settings(settings)
         move_drag.clear()
 
-    # The slider canvas is intentionally excluded: only its round knob handles left-drag.
-    movable_widgets = (root, heading, body, footer, opacity_label, opacity_value)
-    for widget in movable_widgets:
-        widget.bind("<Button-3>", show_menu)
-        widget.bind("<ButtonPress-1>", start_move)
-        widget.bind("<B1-Motion>", move_window)
-        widget.bind("<ButtonRelease-1>", finish_move)
-    slider.bind("<Button-3>", show_menu)
+    canvas.bind("<Button-3>", show_menu)
+    canvas.bind("<ButtonPress-1>", start_move)
+    canvas.bind("<B1-Motion>", move_window)
+    canvas.bind("<ButtonRelease-1>", finish_move)
 
     update_ui()
     root.mainloop()
